@@ -1,0 +1,617 @@
+name: Build SuhbatGram X
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Disk joyini bo'shatish
+        run: sudo rm -rf /usr/share/dotnet /opt/ghc || true
+
+      - name: Kodni yuklab olish
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Java, SDK, NDK va CMake versiyalarini aniqlash
+        id: detect
+        run: |
+          python3 - << 'EOF'
+          import os, re, glob
+
+          java_ver = "17"
+          gw = "gradle/wrapper/gradle-wrapper.properties"
+          if os.path.exists(gw):
+              with open(gw, "r", encoding="utf-8", errors="ignore") as f:
+                  txt = f.read()
+              m = re.search(r"gradle-(\d+)\.(\d+)", txt)
+              if m:
+                  maj, minor = int(m.group(1)), int(m.group(2))
+                  if maj < 7 or (maj == 7 and minor < 3):
+                      java_ver = "11"
+                  elif maj >= 9:
+                      java_ver = "21"
+
+          config_texts = ""
+          for pattern in ("**/build.gradle*", "buildSrc/**/*.kt", "buildSrc/**/*.java"):
+              for p in glob.glob(pattern, recursive=True):
+                  try:
+                      with open(p, "r", encoding="utf-8", errors="ignore") as f:
+                          config_texts += "\n" + f.read()
+                  except Exception:
+                      pass
+
+          def find_ver(patterns, default):
+              for pat in patterns:
+                  m = re.search(pat, config_texts)
+                  if m:
+                      return m.group(1)
+              return default
+
+          compile_sdk = find_ver([r"compileSdkVersion\s*=?\s*(\d+)", r"compileSdk\s*=?\s*(\d+)"], "35")
+          build_tools = find_ver([r'buildToolsVersion\s*=?\s*["\']([^"\']+)["\']'], f"{compile_sdk}.0.0")
+          ndk_ver = find_ver([r'ndkVersion\s*=?\s*["\']([^"\']+)["\']'], "26.1.10909125")
+          cmake_ver = find_ver([r'(?:cmakeVersion|version)\s*=?\s*["\'](\d+\.\d+\.\d+\.\d+)["\']'], "3.22.1")
+
+          print(f"Aniqlangan: Java={java_ver}, SDK={compile_sdk}, BuildTools={build_tools}, NDK={ndk_ver}, CMake={cmake_ver}")
+          with open(os.environ["GITHUB_OUTPUT"], "a") as out:
+              out.write(f"java_ver={java_ver}\n")
+              out.write(f"compile_sdk={compile_sdk}\n")
+              out.write(f"build_tools={build_tools}\n")
+              out.write(f"ndk_ver={ndk_ver}\n")
+              out.write(f"cmake_ver={cmake_ver}\n")
+          EOF
+
+      - name: Java ${{ steps.detect.outputs.java_ver }} sozlash
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ steps.detect.outputs.java_ver }}
+
+      - name: Gradle keshini sozlash
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: ${{ runner.os }}-gradle-${{ hashFiles('**/*.gradle*', '**/gradle-wrapper.properties') }}
+          restore-keys: |
+            ${{ runner.os }}-gradle-
+
+      - name: Android SDK, NDK va CMake o'rnatish
+        run: |
+          SDK_MANAGER="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          yes | $SDK_MANAGER --licenses > /dev/null 2>&1 || true
+          $SDK_MANAGER \
+            "platforms;android-${{ steps.detect.outputs.compile_sdk }}" \
+            "build-tools;${{ steps.detect.outputs.build_tools }}" \
+            "platform-tools" \
+            "ndk;${{ steps.detect.outputs.ndk_ver }}" \
+            "cmake;${{ steps.detect.outputs.cmake_ver }}"
+          echo "sdk.dir=$ANDROID_HOME" > local.properties
+          echo "ndk.dir=$ANDROID_HOME/ndk/${{ steps.detect.outputs.ndk_ver }}" >> local.properties
+          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/${{ steps.detect.outputs.ndk_ver }}" >> $GITHUB_ENV
+
+      - name: Keystore, API kalitlar, logo va SuhbatGram funksiyalarini qo'shish
+        env:
+          APP_ID: ${{ secrets.APP_ID }}
+          APP_HASH: ${{ secrets.APP_HASH }}
+        run: |
+          python3 -c "import PIL" 2>/dev/null || pip3 install --break-system-packages pillow || (sudo apt-get update && sudo apt-get install -y python3-pil)
+
+          mkdir -p TMessagesProj/config
+          rm -f TMessagesProj/config/release.keystore TMessagesProj/config/extera.jks
+          keytool -genkeypair -v -keystore TMessagesProj/config/release.keystore \
+            -keyalg RSA -keysize 2048 -validity 10000 \
+            -alias suhbatgram \
+            -storepass suhbatgram123 -keypass suhbatgram123 \
+            -dname "CN=SuhbatGram, OU=Dev, O=SuhbatGram, L=Tashkent, S=Tashkent, C=UZ"
+          cp TMessagesProj/config/release.keystore TMessagesProj/config/extera.jks
+
+          python3 - << 'EOF'
+          import os, re, glob, json, urllib.request
+          from PIL import Image
+
+          app_id = "".join(os.environ.get("APP_ID", "").split())
+          app_hash = "".join(os.environ.get("APP_HASH", "").split()).strip('"').strip("'")
+
+          if not app_id.isdigit():
+              raise SystemExit("ERROR: APP_ID faqat raqamlardan iborat bo'lishi kerak!")
+          if not app_hash:
+              raise SystemExit("ERROR: APP_HASH bo'sh!")
+
+          props_lines = (
+              f"\nAPP_ID={app_id}\n"
+              f"APP_HASH={app_hash}\n"
+              f"RELEASE_STORE_PASSWORD=suhbatgram123\n"
+              f"RELEASE_KEY_ALIAS=suhbatgram\n"
+              f"RELEASE_KEY_PASSWORD=suhbatgram123\n"
+              f"SIGNING_KEY_STORE_PASSWORD=suhbatgram123\n"
+              f"SIGNING_KEY_ALIAS=suhbatgram\n"
+              f"SIGNING_KEY_PASSWORD=suhbatgram123\n"
+          )
+          with open("local.properties", "a", encoding="utf-8") as f:
+              f.write(props_lines)
+          with open("gradle.properties", "a", encoding="utf-8") as f:
+              f.write(props_lines)
+          with open("API_KEYS", "w", encoding="utf-8") as f:
+              f.write(
+                  f'APP_ID={app_id}\n'
+                  f'APP_HASH="{app_hash}"\n'
+                  f'MAPS_V2_API=none\n'
+                  f'SIGNING_KEY_STORE_PASSWORD=suhbatgram123\n'
+                  f'SIGNING_KEY_ALIAS=suhbatgram\n'
+                  f'SIGNING_KEY_PASSWORD=suhbatgram123\n'
+              )
+
+          bv_path = "TMessagesProj/src/main/java/org/telegram/messenger/BuildVars.java"
+          if os.path.exists(bv_path):
+              with open(bv_path, "r", encoding="utf-8") as f:
+                  c = f.read()
+              c = re.sub(r"public static int APP_ID\s*=.*?;", f"public static int APP_ID = {app_id};", c)
+              c = re.sub(r"public static String APP_HASH\s*=.*?;", f'public static String APP_HASH = "{app_hash}";', c)
+              with open(bv_path, "w", encoding="utf-8") as f:
+                  f.write(c)
+
+          # Ilova nomini SuhbatGram qilish
+          res_dir = "TMessagesProj/src/main/res"
+          for root, _, files in os.walk(res_dir):
+              if "strings.xml" in files:
+                  sp = os.path.join(root, "strings.xml")
+                  with open(sp, "r", encoding="utf-8", errors="ignore") as f:
+                      txt = f.read()
+                  new_txt = re.sub(
+                      r'(<string\b[^>]*\bname="(?:AppName|AppNameBeta|AppNameShort|Nagram|NagramX)"[^>]*>)(.*?)(</string>)',
+                      r'\1SuhbatGram\3',
+                      txt,
+                      flags=re.S,
+                  )
+                  if new_txt != txt:
+                      with open(sp, "w", encoding="utf-8") as f:
+                          f.write(new_txt)
+
+          for gp in glob.glob("**/build.gradle*", recursive=True) + glob.glob("buildSrc/**/*.kt", recursive=True):
+              try:
+                  with open(gp, "r", encoding="utf-8", errors="ignore") as f:
+                      bg = f.read()
+                  bg2 = re.sub(r'("AppName"\s*,\s*")([^"]+)(")', r'\1SuhbatGram\3', bg)
+                  bg2 = re.sub(r'(appName\s*[:=]\s*")([^"]+)(")', r'\1SuhbatGram\3', bg2)
+                  if bg2 != bg:
+                      with open(gp, "w", encoding="utf-8") as f:
+                          f.write(bg2)
+              except Exception:
+                  pass
+
+          # Logotipni avtomatik yuklash va o'rnatish
+          logo_file = None
+          for fname in os.listdir("."):
+              low = fname.lower()
+              if low.startswith("logo.") and low.endswith((".png", ".jpg", ".jpeg", ".webp")):
+                  logo_file = fname
+                  break
+
+          if not logo_file:
+              try:
+                  req = urllib.request.Request(
+                      "https://api.github.com/repos/abubakr583/suhbatgram/contents",
+                      headers={"User-Agent": "SuhbatGram-Builder"},
+                  )
+                  with urllib.request.urlopen(req, timeout=15) as resp:
+                      items = json.loads(resp.read().decode("utf-8"))
+                  for it in items:
+                      nm = it.get("name", "")
+                      if nm.lower().startswith("logo.") and nm.lower().endswith((".png", ".jpg", ".jpeg", ".webp")):
+                          dl = it.get("download_url")
+                          if dl:
+                              urllib.request.urlretrieve(dl, nm)
+                              logo_file = nm
+                              print("Logo eski repodan olindi:", nm)
+                              break
+              except Exception as e:
+                  print("Logo yuklashda ogohlantirish:", e)
+
+          if logo_file:
+              im = Image.open(logo_file).convert("RGBA")
+              w, h = im.size
+              side = min(w, h)
+              im = im.crop(((w - side) // 2, (h - side) // 2, (w + side) // 2, (h + side) // 2))
+
+              icon_names = {"ic_launcher", "ic_launcher_round"}
+              for mf in glob.glob("**/AndroidManifest.xml", recursive=True):
+                  try:
+                      with open(mf, "r", encoding="utf-8", errors="ignore") as f:
+                          mtxt = f.read()
+                      for m in re.finditer(r'android:(?:roundIcon|icon)="@mipmap/([a-zA-Z0-9_]+)"', mtxt):
+                          icon_names.add(m.group(1))
+                  except Exception:
+                      pass
+
+              densities = {
+                  "mipmap-mdpi": 48,
+                  "mipmap-hdpi": 72,
+                  "mipmap-xhdpi": 96,
+                  "mipmap-xxhdpi": 144,
+                  "mipmap-xxxhdpi": 192,
+              }
+
+              for rdir in glob.glob("**/res", recursive=True):
+                  anydpi = os.path.join(rdir, "mipmap-anydpi-v26")
+                  if os.path.isdir(anydpi):
+                      for xf in list(os.listdir(anydpi)):
+                          stem = xf[:-4] if xf.endswith(".xml") else ""
+                          if stem in icon_names or "launcher" in stem.lower():
+                              for dname, sz in densities.items():
+                                  ddir = os.path.join(rdir, dname)
+                                  os.makedirs(ddir, exist_ok=True)
+                                  im.resize((sz, sz), Image.LANCZOS).save(os.path.join(ddir, stem + ".png"), "PNG")
+                              os.remove(os.path.join(anydpi, xf))
+
+                  for root, _, files in os.walk(rdir):
+                      if "mipmap" in os.path.basename(root):
+                          for fn in files:
+                              stem = fn[:-4] if fn.endswith(".png") else ""
+                              if stem and (stem in icon_names or "launcher" in stem.lower() or "foreground" in stem.lower()):
+                                  p = os.path.join(root, fn)
+                                  try:
+                                      ow, oh = Image.open(p).size
+                                      im.resize((ow, oh), Image.LANCZOS).save(p, "PNG")
+                                  except Exception:
+                                      pass
+
+          # Direct Avto-Javob moduli
+          smh_path = "TMessagesProj/src/main/java/org/telegram/messenger/SendMessagesHelper.java"
+          send_call = ""
+          if os.path.exists(smh_path):
+              with open(smh_path, "r", encoding="utf-8", errors="ignore") as f:
+                  smh = f.read()
+
+              def build_args(param_str):
+                  s = param_str
+                  while "<" in s:
+                      s = re.sub(r"<[^<>]*>", "", s)
+                  parts = [p.strip() for p in s.split(",") if p.strip()]
+                  if len(parts) < 2:
+                      return None
+                  if not parts[0].startswith("String ") or not parts[1].startswith("long "):
+                      return None
+                  args = ["replyText", "dialogId"]
+                  for p in parts[2:]:
+                      t = p.split()[0]
+                      if t == "boolean":
+                          args.append("true" if "notify" in p.lower() else "false")
+                      elif t in ("int", "long", "float", "double", "short", "byte"):
+                          args.append("0")
+                      else:
+                          args.append("null")
+                  return ", ".join(args)
+
+              for m in re.finditer(r"public\s+static\s+SendMessageParams\s+of\s*\(([^)]+)\)", smh, re.S):
+                  a = build_args(m.group(1))
+                  if a:
+                      send_call = f"SendMessagesHelper.getInstance(currentAccount).sendMessage(SendMessagesHelper.SendMessageParams.of({a}));"
+                      break
+
+              if not send_call:
+                  for m in re.finditer(r"public\s+void\s+sendMessage\s*\(([^)]+)\)", smh, re.S):
+                      a = build_args(m.group(1))
+                      if a:
+                          send_call = f"SendMessagesHelper.getInstance(currentAccount).sendMessage({a});"
+                          break
+
+          suhbat_java = r'''package org.telegram.messenger;
+
+          import android.app.AlertDialog;
+          import android.content.Context;
+          import android.content.SharedPreferences;
+          import android.graphics.Color;
+          import android.graphics.Typeface;
+          import android.text.TextUtils;
+          import android.util.TypedValue;
+          import android.view.Gravity;
+          import android.widget.Button;
+          import android.widget.EditText;
+          import android.widget.LinearLayout;
+          import android.widget.ScrollView;
+          import android.widget.Switch;
+          import android.widget.TextView;
+          import android.widget.Toast;
+
+          import org.telegram.tgnet.ConnectionsManager;
+          import org.telegram.tgnet.TLRPC;
+
+          import java.util.ArrayList;
+          import java.util.HashSet;
+
+          public class SuhbatAutoReply {
+              private static final String PREFS = "suhbatgram_autoreply_prefs";
+              private static final String KEY_ENABLED = "auto_reply_enabled";
+              private static final String KEY_RULES = "auto_reply_rules_v1";
+              private static final String SEP_PAIR = "\u001F";
+              private static final String SEP_ROW = "\u001E";
+              private static final HashSet<Integer> repliedIds = new HashSet<>();
+
+              private static SharedPreferences prefs() {
+                  return ApplicationLoader.applicationContext.getSharedPreferences(PREFS, Context.MODE_PRIVATE);
+              }
+
+              public static boolean isEnabled() {
+                  try {
+                      return prefs().getBoolean(KEY_ENABLED, false);
+                  } catch (Throwable ignored) {
+                      return false;
+                  }
+              }
+
+              public static void setEnabled(boolean enabled) {
+                  prefs().edit().putBoolean(KEY_ENABLED, enabled).apply();
+              }
+
+              public static ArrayList<String[]> getRules() {
+                  ArrayList<String[]> list = new ArrayList<>();
+                  try {
+                      String raw = prefs().getString(KEY_RULES, null);
+                      if (raw == null) {
+                          list.add(new String[]{"salom", "Assalomu alaykum! Hozir bandman, birozdan keyin javob yozaman."});
+                          saveRules(list);
+                          return list;
+                      }
+                      if (raw.isEmpty()) return list;
+                      for (String r : raw.split(SEP_ROW)) {
+                          String[] kv = r.split(SEP_PAIR, 2);
+                          if (kv.length == 2 && !kv[0].trim().isEmpty() && !kv[1].trim().isEmpty()) {
+                              list.add(new String[]{kv[0], kv[1]});
+                          }
+                      }
+                  } catch (Throwable ignored) {}
+                  return list;
+              }
+
+              public static void saveRules(ArrayList<String[]> list) {
+                  StringBuilder sb = new StringBuilder();
+                  for (int i = 0; i < list.size(); i++) {
+                      if (i > 0) sb.append(SEP_ROW);
+                      String k = list.get(i)[0].replace(SEP_PAIR, " ").replace(SEP_ROW, " ").trim();
+                      String v = list.get(i)[1].replace(SEP_PAIR, " ").replace(SEP_ROW, " ").trim();
+                      sb.append(k).append(SEP_PAIR).append(v);
+                  }
+                  prefs().edit().putString(KEY_RULES, sb.toString()).apply();
+              }
+
+              public static void handleIncoming(final int currentAccount, final TLRPC.Message message) {
+                  try {
+                      if (!isEnabled() || message == null || message.out || message.post) return;
+                      if (TextUtils.isEmpty(message.message)) return;
+                      if (!(message.peer_id instanceof TLRPC.TL_peerUser)) return;
+                      final long dialogId = message.peer_id.user_id;
+                      if (dialogId == 0 || dialogId == UserConfig.getInstance(currentAccount).getClientUserId()) return;
+                      TLRPC.User sender = MessagesController.getInstance(currentAccount).getUser(dialogId);
+                      if (sender != null && sender.bot) return;
+                      int now = ConnectionsManager.getInstance(currentAccount).getCurrentTime();
+                      if (Math.abs(now - message.date) > 60) return;
+                      synchronized (repliedIds) {
+                          if (repliedIds.contains(message.id)) return;
+                          if (repliedIds.size() > 500) repliedIds.clear();
+                          repliedIds.add(message.id);
+                      }
+
+                      String incoming = message.message.trim().toLowerCase();
+                      String matched = null;
+                      for (String[] pair : getRules()) {
+                          String key = pair[0].trim().toLowerCase();
+                          if (!key.isEmpty() && incoming.contains(key)) {
+                              matched = pair[1];
+                              break;
+                          }
+                      }
+                      if (matched == null) return;
+                      final String replyText = matched;
+                      AndroidUtilities.runOnUIThread(() -> {
+                          try {
+                              __SEND_CALL__
+                          } catch (Throwable ignored) {}
+                      });
+                  } catch (Throwable ignored) {}
+              }
+
+              private static int dp(Context c, int v) {
+                  return (int) TypedValue.applyDimension(TypedValue.COMPLEX_UNIT_DIP, v, c.getResources().getDisplayMetrics());
+              }
+
+              public static void showDialog(final Context context) {
+                  if (context == null) return;
+                  ScrollView scroll = new ScrollView(context);
+                  LinearLayout root = new LinearLayout(context);
+                  root.setOrientation(LinearLayout.VERTICAL);
+                  int pad = dp(context, 18);
+                  root.setPadding(pad, dp(context, 12), pad, dp(context, 12));
+                  scroll.addView(root);
+
+                  Switch swAuto = new Switch(context);
+                  swAuto.setText("Direct Avto-Javobni yoqish");
+                  swAuto.setChecked(isEnabled());
+                  swAuto.setPadding(0, dp(context, 8), 0, dp(context, 8));
+                  swAuto.setOnCheckedChangeListener((b, checked) -> {
+                      setEnabled(checked);
+                      Toast.makeText(context, checked ? "Avto-javob yoqildi" : "Avto-javob o'chirildi", Toast.LENGTH_SHORT).show();
+                  });
+                  root.addView(swAuto);
+
+                  TextView header = new TextView(context);
+                  header.setText("Kalit so'zlar ro'yxati:");
+                  header.setTypeface(null, Typeface.BOLD);
+                  header.setTextSize(15);
+                  header.setPadding(0, dp(context, 12), 0, dp(context, 6));
+                  root.addView(header);
+
+                  final LinearLayout rulesBox = new LinearLayout(context);
+                  rulesBox.setOrientation(LinearLayout.VERTICAL);
+                  root.addView(rulesBox);
+
+                  final Runnable[] refreshRef = new Runnable[1];
+                  refreshRef[0] = () -> {
+                      rulesBox.removeAllViews();
+                      ArrayList<String[]> rules = getRules();
+                      if (rules.isEmpty()) {
+                          TextView empty = new TextView(context);
+                          empty.setText("Hali kalit so'z qo'shilmagan.");
+                          rulesBox.addView(empty);
+                          return;
+                      }
+                      for (int i = 0; i < rules.size(); i++) {
+                          final int idx = i;
+                          String[] pair = rules.get(i);
+                          LinearLayout row = new LinearLayout(context);
+                          row.setOrientation(LinearLayout.HORIZONTAL);
+                          row.setGravity(Gravity.CENTER_VERTICAL);
+                          row.setBackgroundColor(Color.argb(28, 128, 128, 128));
+                          int rp = dp(context, 10);
+                          row.setPadding(rp, rp, rp, rp);
+                          LinearLayout.LayoutParams rlp = new LinearLayout.LayoutParams(
+                                  LinearLayout.LayoutParams.MATCH_PARENT,
+                                  LinearLayout.LayoutParams.WRAP_CONTENT
+                          );
+                          rlp.bottomMargin = dp(context, 8);
+                          row.setLayoutParams(rlp);
+
+                          TextView tv = new TextView(context);
+                          tv.setText("So'z: " + pair[0] + "\nJavob: " + pair[1]);
+                          tv.setLayoutParams(new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
+                          row.addView(tv);
+
+                          Button del = new Button(context);
+                          del.setText("O'chirish");
+                          del.setTextSize(12);
+                          del.setOnClickListener(v -> {
+                              ArrayList<String[]> cur = getRules();
+                              if (idx < cur.size()) {
+                                  cur.remove(idx);
+                                  saveRules(cur);
+                                  refreshRef[0].run();
+                              }
+                          });
+                          row.addView(del);
+                          rulesBox.addView(row);
+                      }
+                  };
+                  refreshRef[0].run();
+
+                  Button addBtn = new Button(context);
+                  addBtn.setText("+ Kalit so'z qo'shish");
+                  addBtn.setOnClickListener(v -> {
+                      LinearLayout box = new LinearLayout(context);
+                      box.setOrientation(LinearLayout.VERTICAL);
+                      box.setPadding(dp(context, 18), dp(context, 10), dp(context, 18), dp(context, 6));
+
+                      EditText keyInput = new EditText(context);
+                      keyInput.setHint("Kalit so'z (masalan: salom)");
+                      box.addView(keyInput);
+
+                      EditText valInput = new EditText(context);
+                      valInput.setHint("Avto-javob matni");
+                      box.addView(valInput);
+
+                      new AlertDialog.Builder(context)
+                              .setTitle("Yangi kalit so'z")
+                              .setView(box)
+                              .setPositiveButton("Qo'shish", (d, w) -> {
+                                  String k = keyInput.getText().toString().trim();
+                                  String val = valInput.getText().toString().trim();
+                                  if (k.isEmpty() || val.isEmpty()) return;
+                                  ArrayList<String[]> cur = getRules();
+                                  cur.add(new String[]{k, val});
+                                  saveRules(cur);
+                                  refreshRef[0].run();
+                              })
+                              .setNegativeButton("Bekor", null)
+                              .show();
+                  });
+                  root.addView(addBtn);
+
+                  new AlertDialog.Builder(context)
+                          .setTitle("SuhbatGram Avto-Javob")
+                          .setView(scroll)
+                          .setPositiveButton("Tayyor", null)
+                          .show();
+              }
+          }
+          '''.replace("__SEND_CALL__", send_call if send_call else "// no send call")
+
+          suhbat_lines = [line[10:] if line.startswith("          ") else line for line in suhbat_java.splitlines()]
+          with open("TMessagesProj/src/main/java/org/telegram/messenger/SuhbatAutoReply.java", "w", encoding="utf-8") as f:
+              f.write("\n".join(suhbat_lines) + "\n")
+
+          mc_path = "TMessagesProj/src/main/java/org/telegram/messenger/MessagesController.java"
+          if os.path.exists(mc_path):
+              with open(mc_path, "r", encoding="utf-8", errors="ignore") as f:
+                  mc = f.read()
+              m = re.search(
+                  r"(public\s+void\s+processUpdateArray\s*\(\s*ArrayList<TLRPC\.Update>\s+(\w+)[^)]*\)\s*\{)",
+                  mc,
+              )
+              if m:
+                  list_var = m.group(2)
+                  hook = (
+                      f"\n if ({list_var} != null) {{\n"
+                      f"     for (int _si = 0; _si < {list_var}.size(); _si++) {{\n"
+                      f"         TLRPC.Update _su = {list_var}.get(_si);\n"
+                      f"         if (_su instanceof TLRPC.TL_updateNewMessage) {{\n"
+                      f"             SuhbatAutoReply.handleIncoming(currentAccount, ((TLRPC.TL_updateNewMessage) _su).message);\n"
+                      f"         }}\n"
+                      f"     }}\n"
+                      f" }}\n"
+                  )
+                  mc = mc[: m.end()] + hook + mc[m.end() :]
+                  with open(mc_path, "w", encoding="utf-8") as f:
+                      f.write(mc)
+
+          pa_path = "TMessagesProj/src/main/java/org/telegram/ui/ProfileActivity.java"
+          if os.path.exists(pa_path):
+              with open(pa_path, "r", encoding="utf-8") as f:
+                  pa = f.read()
+              pa2 = re.sub(
+                  r"(otherItem\.addSubItem\([^;]+R\.string\.LogOut[^;]*\);)",
+                  r'otherItem.addSubItem(9999, 0, "SuhbatGram Avto-Javob"); \1',
+                  pa,
+                  count=1,
+              )
+              pa2 = re.sub(
+                  r"(actionBar\.setActionBarMenuOnItemClick\s*\(\s*new\s+ActionBar\.ActionBarMenuOnItemClick\s*\(\s*\)\s*\{\s*@Override\s*public\s+void\s+onItemClick\s*\(\s*int\s+id\s*\)\s*\{)",
+                  r"\1 if (id == 9999) { org.telegram.messenger.SuhbatAutoReply.showDialog(getParentActivity()); return; }",
+                  pa2,
+                  count=1,
+              )
+              if pa2 != pa:
+                  with open(pa_path, "w", encoding="utf-8") as f:
+                      f.write(pa2)
+          EOF
+
+      - name: Gradle ruxsatini berish
+        run: chmod +x gradlew
+
+      - name: Faqat bitta asosiy APK yig'ish
+        env:
+          GRADLE_OPTS: "-Xmx5g -Xss16m"
+        run: |
+          TASKS=$(./gradlew tasks --all --no-daemon 2>/dev/null || true)
+          if echo "$TASKS" | grep -q ":TMessagesProj_App:assembleArm64Release"; then
+            FULL_TASK=":TMessagesProj_App:assembleArm64Release"
+          elif echo "$TASKS" | grep -q ":TMessagesProj:assembleArm64Release"; then
+            FULL_TASK=":TMessagesProj:assembleArm64Release"
+          elif echo "$TASKS" | grep -q "assembleArm64Release"; then
+            FULL_TASK="assembleArm64Release"
+          elif echo "$TASKS" | grep -q ":TMessagesProj_App:assembleRelease"; then
+            FULL_TASK=":TMessagesProj_App:assembleRelease"
+          else
+            FULL_TASK="assembleRelease"
+          fi
+          echo "Tanlangan tezlashtirilgan vazifa: $FULL_TASK"
+          ./gradlew "$FULL_TASK" --no-daemon --no-configuration-cache -Dorg.gradle.jvmargs="-Xmx5g -Xss16m"
+
+      - name: Tayyor APK ni saqlash
+        uses: actions/upload-artifact@v4
+        with:
+          name: SuhbatGram-X-APK
+          path: "**/build/outputs/apk/**/*.apk"
